@@ -4,13 +4,19 @@ from tkinter import messagebox
 import threading
 import json
 import os
+import sys
 import time
+import subprocess
 import requests
 import hashlib
 from PIL import Image
 import imagehash
 import io
 from datetime import datetime
+
+# ── Версия и авто-обновление ──────────────────────────────────────────────────
+CURRENT_VERSION = "1.0.0"
+GITHUB_VERSION_URL = "https://raw.githubusercontent.com/LimitedQJ/vfx-texture-detector/main/version.json"
 
 # ── Тема ──────────────────────────────────────────────────────────────────────
 ctk.set_appearance_mode("dark")
@@ -129,6 +135,50 @@ def save_pending_deletion(ids: list):
     }
     with open(PENDING_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+def check_for_update() -> dict | None:
+    """Проверяет наличие новой версии на GitHub."""
+    try:
+        resp = requests.get(GITHUB_VERSION_URL, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            latest = data.get("version", "0.0.0")
+            if latest != CURRENT_VERSION:
+                return data
+    except Exception:
+        pass
+    return None
+
+
+def download_and_update(url: str, on_progress=None):
+    """Скачивает новый .exe и перезапускает приложение."""
+    try:
+        resp = requests.get(url, stream=True, timeout=60)
+        total = int(resp.headers.get("content-length", 0))
+        downloaded = 0
+        exe_path = os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__)
+        tmp_path = exe_path + ".new"
+
+        with open(tmp_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if on_progress and total > 0:
+                        on_progress(downloaded / total * 100)
+
+        if getattr(sys, "frozen", False):
+            bat = exe_path + "_update.bat"
+            with open(bat, "w") as f:
+                f.write(f'@echo off\ntimeout /t 2 /nobreak\nmove /y "{tmp_path}" "{exe_path}"\nstart "" "{exe_path}"\ndel "%~f0"\n')
+            subprocess.Popen(bat, shell=True)
+            sys.exit(0)
+        else:
+            os.replace(tmp_path, exe_path)
+            os.execl(sys.executable, sys.executable, *sys.argv)
+    except Exception as e:
+        raise e
 
 
 # ── Анимированная кнопка ───────────────────────────────────────────────────────
@@ -269,6 +319,9 @@ class TextureDetectorApp(ctk.CTk):
         self._log("INFO", f"Файл ввода: {INPUT_FILE}")
         self._log("INFO", "Ожидание данных от плагина Roblox Studio...")
 
+        # Авто-обновление — проверяем при запуске
+        threading.Thread(target=self._check_update_on_start, daemon=True).start()
+
         # Автоматически проверяем наличие input файла
         self._watch_input()
 
@@ -363,8 +416,15 @@ class TextureDetectorApp(ctk.CTk):
                                              font=FONT_SMALL, text_color=C["WARNING"])
         self._connection_dot.pack(pady=(0, 8))
 
-        ctk.CTkLabel(sidebar, text="v1.0.0", font=FONT_SMALL,
-                     text_color=C["SUBTEXT"]).pack(pady=(0, 12))
+        ctk.CTkLabel(sidebar, text="v" + CURRENT_VERSION, font=FONT_SMALL,
+                     text_color=C["SUBTEXT"]).pack(pady=(0, 4))
+
+        self._update_btn = ctk.CTkButton(
+            sidebar, text="", font=FONT_SMALL, height=0,
+            fg_color="transparent", hover_color="transparent",
+            text_color="transparent", command=self._do_update
+        )
+        self._update_btn.pack(pady=(0, 8))
 
     def _build_topbar(self, parent):
         topbar = ctk.CTkFrame(parent, fg_color="transparent", height=70)
@@ -517,6 +577,53 @@ class TextureDetectorApp(ctk.CTk):
         self._stat_selected.set_value("0")
         self._delete_btn.configure(state="disabled", text_color=C["SUBTEXT2"])
         self._subtitle.configure(text="Готов к сканированию")
+
+    def _check_update_on_start(self):
+        """Проверяет обновления при запуске в фоновом потоке."""
+        self._update_data = check_for_update()
+        if self._update_data:
+            version = self._update_data.get("version", "?")
+            changelog = self._update_data.get("changelog", "")
+            self.after(0, self._show_update_notification, version, changelog)
+
+    def _show_update_notification(self, version: str, changelog: str):
+        """Показывает кнопку обновления в сайдбаре."""
+        self._log("WARNING", f"Доступна новая версия: v{version}!")
+        self._update_btn.configure(
+            text=f"⬆  Обновить до v{version}",
+            height=32, corner_radius=8,
+            fg_color=C["WARNING"], hover_color=C["ACCENT"],
+            text_color="#000000"
+        )
+
+    def _do_update(self):
+        """Запускает загрузку и установку обновления."""
+        if not hasattr(self, "_update_data") or not self._update_data:
+            return
+        url = self._update_data.get("download_url", "")
+        version = self._update_data.get("version", "?")
+        if not url:
+            messagebox.showerror("Ошибка", "Ссылка на обновление недоступна.")
+            return
+
+        if not messagebox.askyesno("Обновление",
+            f"Доступна версия v{version}.\n\nСкачать и установить?\nПриложение перезапустится."):
+            return
+
+        self._update_btn.configure(text="⏳ Скачивание...", state="disabled")
+        self._log("INFO", f"Скачиваю обновление v{version}...")
+
+        def run():
+            try:
+                def on_progress(pct):
+                    self.after(0, self._update_btn.configure,
+                               {"text": f"⏳ {pct:.0f}%"})
+                download_and_update(url, on_progress)
+            except Exception as e:
+                self.after(0, messagebox.showerror, "Ошибка обновления", str(e))
+                self.after(0, self._update_btn.configure, {"state": "normal"})
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _watch_input(self):
         """Проверяет наличие нового input файла от плагина."""
